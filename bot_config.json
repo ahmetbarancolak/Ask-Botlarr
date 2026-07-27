@@ -1,0 +1,28 @@
+{
+    "owner_id": 982696957829058570,
+    "guild_id": 1526889714471276554,
+    "voice_channel_id": 1531326998163750973,
+    "log_channel_id": 1531329667724873799,
+    "bot1_token": null,
+    "bot2_token": null,
+    "bot1_id": 1531325774890663986,
+    "bot2_id": 1531327095257698466,
+    "moderation_enabled": true,
+    "max_warnings": 3,
+    "security_features": {
+        "anti_spam": true,
+        "anti_raid": true,
+        "auto_role": true,
+        "server_lock": false
+    },
+    "protected_roles": [],
+    "protected_users": [],
+    "last_setup": null,
+    "version": "1.0.0",
+    "welcome_message": "Sunucuya hoş geldin! Kurallarımızı lütfen oku.",
+    "leave_message": "Hoşça kalın!",
+    "log_all_events": true,
+    "purge_logs_after_days": 30,
+    "auto_role_name": "üye",
+    "admin_role_name": "yönetici"
+}
