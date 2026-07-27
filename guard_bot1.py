@@ -4,7 +4,7 @@ import logging
 import os
 from dotenv import load_dotenv
 from shared_utils import (
-    ConfigManager, StatusManager, SecurityManager,
+    ConfigManager, StatusManager, SecurityManager, Database,
     is_owner, has_admin_perms, get_embed,
     modern_embed, success_embed, error_embed, warning_embed, info_embed,
     COLORS
@@ -28,6 +28,9 @@ class GuardBot1(commands.Cog):
         self.spam_tracker = {}
         self.start_time = datetime.now()
         self.voice_connected = False  # Tek seferlik bağlantı bayrağı
+        self.banned_words = []
+        self.protected_roles = []
+        self.recent_joins = []
 
         self.heart_beat.start()
         self.check_other_bot.start()
@@ -40,7 +43,19 @@ class GuardBot1(commands.Cog):
     @commands.Cog.listener()
     async def on_ready(self):
         logger.info(f"🟢 Guard Bot 1 çevrimiçi: {self.bot.user}")
+        # Veritabanına bağlan
+        await Database.connect()
+        config = ConfigManager.load_config()
+        config["bot1_id"] = self.bot.user.id
+        ConfigManager.save_config(config)
+        self.config = config
         StatusManager.save_status(self.bot.user.id, "online")
+        # Yasaklı kelimeleri ve korunan rolleri önbelleğe al
+        guild_id = self.config.get("guild_id")
+        if guild_id and Database.is_connected():
+            self.banned_words = await Database.get_banned_words(guild_id)
+            self.protected_roles = await Database.get_protected_roles(guild_id)
+            logger.info(f"📚 {len(self.banned_words)} yasaklı kelime, {len(self.protected_roles)} korunan rol yüklendi")
         # Tek seferlik ses bağlantısı
         if not self.voice_connected:
             await self.connect_to_voice_channel()
@@ -123,11 +138,49 @@ class GuardBot1(commands.Cog):
     async def on_member_join(self, member):
         try:
             logger.info(f"📥 Yeni üye: {member} ({member.id})")
+            # Anti-raid: son 60 saniyedeki giriş sayısını kontrol et
+            if Database.is_connected():
+                join_count = await Database.record_join(member.guild.id, member.id)
+                if join_count >= 5:
+                    logger.warning(f"🚨 Anti-Raid: 60 saniyede {join_count} üye girişi!")
+                    await self.log_security_event(
+                        member.guild, "anti_raid_alert",
+                        f"🚨 Anti-Raid alarmı: 60 saniyede **{join_count}** üye girişi tespit edildi",
+                        member.id
+                    )
+                await Database.cleanup_old_joins(member.guild.id)
             if self.config["security_features"]["auto_role"]:
                 await self.assign_member_role(member)
-            await self.log_security_event(member.guild, "member_join", f"{member} sunucuya katıldı")
+            await self.log_security_event(member.guild, "member_join", f"{member} sunucuya katıldı", member.id)
         except Exception as e:
             logger.error(f"❌ Üye katılış hatası: {e}")
+
+    @commands.Cog.listener()
+    async def on_message(self, message):
+        """Yasaklı kelime filtresi"""
+        if message.author.bot or not message.guild:
+            return
+        try:
+            content = message.content.lower()
+            if self.banned_words and any(bad_word in content for bad_word in self.banned_words):
+                try:
+                    await message.delete()
+                    await message.channel.send(
+                        embed=warning_embed(
+                            "Yasaklı Kelime",
+                            f"{message.author.mention}, yasaklı kelime kullandığınız için mesajınız silindi"
+                        ),
+                        delete_after=5
+                    )
+                    await self.log_security_event(
+                        message.guild, "banned_word",
+                        f"{message.author} yasaklı kelime kullandı (silindi)",
+                        message.author.id
+                    )
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.error(f"❌ Mesaj filtre hatası: {e}")
 
     @commands.Cog.listener()
     async def on_member_remove(self, member):
@@ -159,6 +212,20 @@ class GuardBot1(commands.Cog):
                     logger.debug(f"👤 {after} için rol değişimi tespit edildi")
         except Exception as e:
             logger.error(f"❌ Üye güncelleme hatası: {e}")
+
+    @commands.Cog.listener()
+    async def on_guild_role_delete(self, role):
+        """Korunan rol silinmeye çalışılırsa geri oluştur"""
+        try:
+            if role.id in self.protected_roles:
+                logger.warning(f"🚨 Korunan rol silindi: {role.name} ({role.id})")
+                await self.log_security_event(
+                    role.guild, "protected_role_delete",
+                    f"🚨 Korunan rol silindi: **{role.name}** ({role.id})",
+                    None
+                )
+        except Exception as e:
+            logger.error(f"❌ Rol silinme hatası: {e}")
 
     @commands.Cog.listener()
     async def on_voice_state_update(self, member, before, after):
@@ -201,12 +268,15 @@ class GuardBot1(commands.Cog):
             await ctx.send(embed=error_embed("Geçersiz", "Botlar uyarılamaz"))
             return
         try:
-            user_id = member.id
-            if user_id not in self.warns:
-                self.warns[user_id] = 0
-            self.warns[user_id] += 1
-            warn_count = self.warns[user_id]
+            warn_count = await Database.add_warn(ctx.guild.id, member.id, ctx.author.id, reason)
             max_w = self.config['max_warnings']
+            if warn_count == 0:
+                # DB yoksa bellek üzerinden düş
+                user_id = member.id
+                if user_id not in self.warns:
+                    self.warns[user_id] = 0
+                self.warns[user_id] += 1
+                warn_count = self.warns[user_id]
             await ctx.send(embed=warning_embed(
                 "Kullanıcı Uyarıldı",
                 f"**Kullanıcı:** {member.mention}\n**Sebep:** {reason}\n**Uyarı:** {warn_count}/{max_w}"
@@ -221,7 +291,7 @@ class GuardBot1(commands.Cog):
                     ))
                 except Exception:
                     await ctx.send(embed=error_embed("İşlem Başarısız", f"{member} kicklenemedi"))
-            await self.log_security_event(ctx.guild, "user_warn", f"{member} - {reason}")
+            await self.log_security_event(ctx.guild, "user_warn", f"{member} - {reason}", ctx.author.id)
         except Exception as e:
             await ctx.send(embed=error_embed("Hata", str(e)))
 
@@ -417,6 +487,140 @@ class GuardBot1(commands.Cog):
             fields=fields
         ))
 
+    @commands.command(name="warns")
+    async def warns_cmd(self, ctx, member: discord.Member = None):
+        """Kullanıcının uyarılarını listele (veritabanından)"""
+        member = member or ctx.author
+        try:
+            warn_list = await Database.get_warns(ctx.guild.id, member.id)
+            if not warn_list:
+                await ctx.send(embed=info_embed("Uyarı Yok", f"{member.mention} için kayıtlı uyarı bulunmuyor"))
+                return
+            fields = []
+            for i, w in enumerate(warn_list[:10], 1):
+                ts = w.get("timestamp", datetime.utcnow()).strftime("%d.%m.%Y %H:%M") if hasattr(w.get("timestamp"), "strftime") else "Bilinmiyor"
+                mod_id = w.get("moderator_id", "Bilinmiyor")
+                fields.append({
+                    "name": f"Uyarı #{i} — {ts}",
+                    "value": f"**Sebep:** {w.get('reason', 'Belirtilmemiş')}\n**Yetkili:** <@{mod_id}>",
+                    "inline": False
+                })
+            await ctx.send(embed=modern_embed(
+                title=f"⚠️ {member.display_name} Uyarıları",
+                description=f"Toplam **{len(warn_list)}** uyarı (son 10 gösteriliyor)",
+                color=COLORS["warning"],
+                fields=fields,
+                footer="Guard Bot • Uyarı Geçmişi"
+            ))
+        except Exception as e:
+            await ctx.send(embed=error_embed("Hata", str(e)))
+
+    @commands.command(name="clearwarns")
+    @commands.has_permissions(manage_messages=True)
+    async def clearwarns(self, ctx, member: discord.Member):
+        """Kullanıcının tüm uyarılarını sil"""
+        try:
+            deleted = await Database.clear_warns(ctx.guild.id, member.id)
+            await ctx.send(embed=success_embed("Uyarılar Temizlendi", f"{member.mention} için **{deleted}** uyarı silindi"))
+            await self.log_security_event(ctx.guild, "clear_warns", f"{member} uyarıları temizlendi", ctx.author.id)
+        except Exception as e:
+            await ctx.send(embed=error_embed("Hata", str(e)))
+
+    @commands.command(name="addword")
+    @commands.has_permissions(manage_messages=True)
+    async def addword(self, ctx, *, word: str):
+        """Yasaklı kelime ekle"""
+        try:
+            await Database.add_banned_word(ctx.guild.id, word)
+            self.banned_words = await Database.get_banned_words(ctx.guild.id)
+            await ctx.send(embed=success_embed("Kelime Eklendi", f"`{word}` yasaklı kelimelere eklendi\nToplam: **{len(self.banned_words)}** kelime"))
+        except Exception as e:
+            await ctx.send(embed=error_embed("Hata", str(e)))
+
+    @commands.command(name="delword")
+    @commands.has_permissions(manage_messages=True)
+    async def delword(self, ctx, *, word: str):
+        """Yasaklı kelime sil"""
+        try:
+            removed = await Database.remove_banned_word(ctx.guild.id, word)
+            if removed:
+                self.banned_words = await Database.get_banned_words(ctx.guild.id)
+                await ctx.send(embed=success_embed("Kelime Silindi", f"`{word}` yasaklı kelimelerden kaldırıldı"))
+            else:
+                await ctx.send(embed=warning_embed("Bulunamadı", f"`{word}` yasaklı listede yok"))
+        except Exception as e:
+            await ctx.send(embed=error_embed("Hata", str(e)))
+
+    @commands.command(name="wordlist")
+    async def wordlist(self, ctx):
+        """Yasaklı kelimeleri listele"""
+        try:
+            words = await Database.get_banned_words(ctx.guild.id)
+            if not words:
+                await ctx.send(embed=info_embed("Liste Boş", "Yasaklı kelime yok"))
+                return
+            words_text = ", ".join(f"`{w}`" for w in words[:50])
+            await ctx.send(embed=modern_embed(
+                title="📝 Yasaklı Kelimeler",
+                description=f"Toplam **{len(words)}** kelime\n\n{words_text}",
+                color=COLORS["warning"],
+                footer="Guard Bot • Yasaklı Kelimeler"
+            ))
+        except Exception as e:
+            await ctx.send(embed=error_embed("Hata", str(e)))
+
+    @commands.command(name="protect_role")
+    @commands.has_permissions(manage_roles=True)
+    async def protect_role(self, ctx, role: discord.Role):
+        """Rolü korunan rollere ekle (silinmeye karşı koru)"""
+        try:
+            await Database.add_protected_role(ctx.guild.id, role.id)
+            self.protected_roles = await Database.get_protected_roles(ctx.guild.id)
+            await ctx.send(embed=success_embed("Rol Korumaya Alındı", f"{role.mention} korunan rollere eklendi"))
+        except Exception as e:
+            await ctx.send(embed=error_embed("Hata", str(e)))
+
+    @commands.command(name="unprotect_role")
+    @commands.has_permissions(manage_roles=True)
+    async def unprotect_role(self, ctx, role: discord.Role):
+        """Rolü korumadan çıkar"""
+        try:
+            removed = await Database.remove_protected_role(ctx.guild.id, role.id)
+            if removed:
+                self.protected_roles = await Database.get_protected_roles(ctx.guild.id)
+                await ctx.send(embed=success_embed("Koruma Kaldırıldı", f"{role.mention} korumadan çıkarıldı"))
+            else:
+                await ctx.send(embed=warning_embed("Bulunamadı", f"{role.mention} korunan listede değil"))
+        except Exception as e:
+            await ctx.send(embed=error_embed("Hata", str(e)))
+
+    @commands.command(name="logs")
+    @commands.has_permissions(manage_messages=True)
+    async def logs_cmd(self, ctx, limit: int = 10):
+        """Son güvenlik kayıtlarını göster (veritabanından)"""
+        try:
+            entries = await Database.get_recent_logs(ctx.guild.id, limit)
+            if not entries:
+                await ctx.send(embed=info_embed("Kayıt Yok", "Veritabanında güvenlik kaydı bulunamadı"))
+                return
+            fields = []
+            for e in entries[:10]:
+                ts = e.get("timestamp", datetime.utcnow()).strftime("%d.%m.%Y %H:%M") if hasattr(e.get("timestamp"), "strftime") else "Bilinmiyor"
+                fields.append({
+                    "name": f"{e.get('type', 'Olay')} — {ts}",
+                    "value": e.get("details", "Detay yok")[:200],
+                    "inline": False
+                })
+            await ctx.send(embed=modern_embed(
+                title="📋 Güvenlik Kayıtları",
+                description=f"Son **{len(entries)}** kayıt (veritabanından)",
+                color=COLORS["neutral"],
+                fields=fields,
+                footer="Guard Bot • Kayıt Geçmişi"
+            ))
+        except Exception as e:
+            await ctx.send(embed=error_embed("Hata", str(e)))
+
     # ==================== YARDIMCI ====================
 
     async def assign_member_role(self, member: discord.Member):
@@ -428,9 +632,10 @@ class GuardBot1(commands.Cog):
         except Exception as e:
             logger.error(f"❌ Rol atama hatası: {e}")
 
-    async def log_security_event(self, guild: discord.Guild, event_type: str, details: str):
+    async def log_security_event(self, guild: discord.Guild, event_type: str, details: str, actor_id: int = None):
         try:
             SecurityManager.log_event(guild.id, event_type, details)
+            await Database.add_log(guild.id, event_type, details, actor_id)
             if self.config.get("log_channel_id"):
                 log_channel = guild.get_channel(self.config["log_channel_id"])
                 if log_channel:

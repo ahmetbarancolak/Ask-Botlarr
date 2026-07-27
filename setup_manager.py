@@ -4,7 +4,7 @@ import logging
 import asyncio
 from datetime import datetime
 from shared_utils import (
-    ConfigManager, StatusManager, is_owner,
+    ConfigManager, StatusManager, Database, is_owner,
     modern_embed, success_embed, error_embed, warning_embed, info_embed,
     COLORS
 )
@@ -24,7 +24,6 @@ class SetupManager(commands.Cog):
         """Guard Bot Sistemi kurulumu - adım adım modern arayüz"""
         owner_id = self.config.get("owner_id")
 
-        # Owner ID kontrolü
         if owner_id is None:
             await ctx.send(embed=error_embed(
                 "Bot Sahip ID'si Ayarlanmamış",
@@ -45,7 +44,10 @@ class SetupManager(commands.Cog):
             ))
             return
 
-        # Setup'a başla
+        # Veritabanına bağlan
+        db_ok = await Database.connect()
+        db_status = "✅ Bağlı" if db_ok else "❌ Bağlantı yok (dosya tabanlı yedek aktif)"
+
         await ctx.send(embed=modern_embed(
             title="⚙️ Guard Bot Kurulumu",
             description=(
@@ -55,6 +57,7 @@ class SetupManager(commands.Cog):
                 "• 🎙️ Ses kanalı seçimi\n"
                 "• 📝 Günlük kanalı seçimi\n"
                 "• 🔒 Güvenlik ayarları\n\n"
+                f"**Veritabanı:** {db_status}\n\n"
                 "**⏱️ Her adımda 60 saniyeniz var.**\n"
                 "**💡 İptal etmek için `iptal` yazın.**"
             ),
@@ -181,10 +184,12 @@ class SetupManager(commands.Cog):
             footer="Guard Bot • Güvenlik Özeti"
         ))
 
-        # Kaydet
+        # Kaydet - hem dosyaya hem veritabanına
         self.config["owner_id"] = owner_id
         self.config["last_setup"] = datetime.now().isoformat()
         ConfigManager.save_config(self.config)
+        if Database.is_connected():
+            await Database.save_guild_config(guild_id, self.config)
         self.config = ConfigManager.load_config()
 
         await asyncio.sleep(1)
@@ -197,6 +202,7 @@ class SetupManager(commands.Cog):
             {"name": "🤖 Bot 1", "value": f"`{self.config.get('bot1_id', 'Bekleniyor')}`", "inline": True},
             {"name": "🤖 Bot 2", "value": f"`{self.config.get('bot2_id', 'Bekleniyor')}`", "inline": True},
             {"name": "👤 Sahip", "value": f"<@{owner_id}>", "inline": True},
+            {"name": "💾 Veritabanı", "value": db_status, "inline": False},
         ]
         await ctx.send(embed=modern_embed(
             title="✅ Kurulum Tamamlandı",
@@ -220,6 +226,7 @@ class SetupManager(commands.Cog):
         """Sistem durumunu modern embed ile göster"""
         try:
             sec = self.config["security_features"]
+            db_status = "✅ Bağlı" if Database.is_connected() else "❌ Bağlantı yok"
             fields = [
                 {"name": "⚙️ Konfigürasyon", "value": (
                     f"**Sunucu:** `{self.config.get('guild_id', 'Ayarlanmadı')}`\n"
@@ -237,9 +244,9 @@ class SetupManager(commands.Cog):
                     f"Korunan Roller: **{len(self.config.get('protected_roles', []))}**\n"
                     f"Korunan Kullanıcılar: **{len(self.config.get('protected_users', []))}**"
                 ), "inline": True},
+                {"name": "💾 Veritabanı", "value": db_status, "inline": False},
             ]
 
-            # Bot durumları
             bot1_id = self.config.get("bot1_id")
             bot2_id = self.config.get("bot2_id")
             bot_lines = []
@@ -273,6 +280,8 @@ class SetupManager(commands.Cog):
             if feature.lower() in self.config["security_features"]:
                 self.config["security_features"][feature.lower()] = state_bool
                 ConfigManager.save_config(self.config)
+                if Database.is_connected():
+                    await Database.save_guild_config(self.config.get("guild_id", ctx.guild.id), self.config)
                 await ctx.send(embed=success_embed(
                     "Ayar Güncellendi",
                     f"**{feature}**: {'✅ Açık' if state_bool else '❌ Kapalı'}"
@@ -288,8 +297,8 @@ class SetupManager(commands.Cog):
         """Modern yardım menüsü"""
         categories = {
             "yönetim": {
-                title: "⚙️ Yönetim Komutları",
-                cmds: [
+                "title": "⚙️ Yönetim Komutları",
+                "cmds": [
                     ("`.setup`", "Sistem kurulumu (sihirbaz)"),
                     ("`.status`", "Sistem durumunu göster"),
                     ("`.check_bot`", "Bot durumunu kontrol et"),
@@ -297,9 +306,11 @@ class SetupManager(commands.Cog):
                 ]
             },
             "moderasyon": {
-                title: "⚠️ Moderasyon Komutları",
-                cmds: [
-                    ("`.warn @kullanıcı [sebep]`", "Kullanıcıyı uyar"),
+                "title": "⚠️ Moderasyon Komutları",
+                "cmds": [
+                    ("`.warn @kullanıcı [sebep]`", "Kullanıcıyı uyar (veritabanına kaydeder)"),
+                    ("`.warns [@kullanıcı]`", "Kullanıcının uyarı geçmişini göster"),
+                    ("`.clearwarns @kullanıcı`", "Kullanıcının uyarılarını temizle"),
                     ("`.purge [sayı]`", "Son N mesajı sil (max 100)"),
                     ("`.mute @kullanıcı [sebep]`", "10 dakika sustur"),
                     ("`.unmute @kullanıcı`", "Susturmayı kaldır"),
@@ -307,23 +318,27 @@ class SetupManager(commands.Cog):
                 ]
             },
             "güvenlik": {
-                title: "🔒 Güvenlik Komutları",
-                cmds: [
+                "title": "🔒 Güvenlik Komutları",
+                "cmds": [
                     ("`.lock_server`", "Sunucuyu kilitle"),
                     ("`.unlock_server`", "Sunucu kilidini aç"),
-                    ("`.risk_check @kullanıcı`", "Kullanıcı risk analizi"),
+                    ("`.addword <kelime>`", "Yasaklı kelime ekle"),
+                    ("`.delword <kelime>`", "Yasaklı kelime sil"),
+                    ("`.wordlist`", "Yasaklı kelimeleri listele"),
+                    ("`.protect_role @rol`", "Rolü korumaya al"),
+                    ("`.unprotect_role @rol`", "Rolü korumadan çıkar"),
+                    ("`.logs [sayı]`", "Son güvenlik kayıtları (veritabanı)"),
                 ]
             },
             "bilgi": {
-                title: "ℹ️ Bilgi Komutları",
-                cmds: [
+                "title": "ℹ️ Bilgi Komutları",
+                "cmds": [
                     ("`.ping`", "Bot gecikmesi"),
                     ("`.uptime`", "Çalışma süresi"),
                     ("`.serverinfo`", "Sunucu bilgileri"),
                     ("`.userinfo [@kullanıcı]`", "Kullanıcı bilgileri"),
                     ("`.botinfo`", "Bot bilgileri"),
                     ("`.avatar [@kullanıcı]`", "Avatarı göster"),
-                    ("`.reputation [@kullanıcı]`", "İtibar durumu"),
                 ]
             }
         }
@@ -347,16 +362,15 @@ class SetupManager(commands.Cog):
                 ))
             return
 
-        # Ana yardım menüsü
         all_cmds = []
         for cat in categories.values():
             all_cmds.extend(cat["cmds"])
 
         overview_fields = [
             {"name": "⚙️ Yönetim", "value": "`.setup` `.status` `.check_bot` `.set_protection`", "inline": False},
-            {"name": "⚠️ Moderasyon", "value": "`.warn` `.purge` `.mute` `.unmute` `.slowmode`", "inline": False},
-            {"name": "🔒 Güvenlik", "value": "`.lock_server` `.unlock_server` `.risk_check`", "inline": False},
-            {"name": "ℹ️ Bilgi", "value": "`.ping` `.uptime` `.serverinfo` `.userinfo` `.botinfo` `.avatar` `.reputation`", "inline": False},
+            {"name": "⚠️ Moderasyon", "value": "`.warn` `.warns` `.clearwarns` `.purge` `.mute` `.unmute` `.slowmode`", "inline": False},
+            {"name": "🔒 Güvenlik", "value": "`.lock_server` `.unlock_server` `.addword` `.delword` `.wordlist` `.protect_role` `.unprotect_role` `.logs`", "inline": False},
+            {"name": "ℹ️ Bilgi", "value": "`.ping` `.uptime` `.serverinfo` `.userinfo` `.botinfo` `.avatar`", "inline": False},
             {"name": "📚 Detaylı Yardım", "value": "`.help <kategori>` ile kategori detayları\nÖrn: `.help moderasyon`", "inline": False},
         ]
         await ctx.send(embed=modern_embed(

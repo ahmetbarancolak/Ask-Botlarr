@@ -2,12 +2,325 @@ import json
 import os
 import logging
 from datetime import datetime
-from typing import Dict, Optional, List
+from typing import Dict, Optional, List, Any
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 CONFIG_FILE = 'bot_config.json'
+
+# ==================== MONGODB VERİ KATMANI ====================
+
+try:
+    from motor.motor_asyncio import AsyncIOMotorClient
+    _MOTOR_AVAILABLE = True
+except ImportError:
+    _MOTOR_AVAILABLE = False
+    logger.warning("motor yüklü değil - veritabanı özellikleri devre dışı")
+
+_MONGO_URL = os.getenv("MONGODB_URL", "")
+_MONGO_DB = os.getenv("MONGODB_DB_NAME", "guardbot")
+
+
+class Database:
+    """MongoDB asenkron veri katmanı.
+    Tüm kalıcı veri (uyarılar, kayıtlar, yapılandırma) burada tutulur.
+    Motor (async) kullanır; bot yeniden başlasa bile veriler korunur.
+    """
+
+    _client = None
+    _db = None
+    _connected = False
+
+    @classmethod
+    async def connect(cls) -> bool:
+        if not _MOTOR_AVAILABLE or not _MONGO_URL:
+            logger.warning("MongoDB bağlantısı atlandı (motor yok veya URL yok)")
+            return False
+        if cls._connected and cls._client is not None:
+            return True
+        try:
+            cls._client = AsyncIOMotorClient(_MONGO_URL, serverSelectionTimeoutMS=8000)
+            cls._db = cls._client[_MONGO_DB]
+            await cls._client.admin.command("ping")
+            cls._connected = True
+            logger.info("✅ MongoDB bağlantısı kuruldu")
+            return True
+        except Exception as e:
+            logger.error(f"❌ MongoDB bağlantı hatası: {e}")
+            cls._connected = False
+            return False
+
+    @classmethod
+    def is_connected(cls) -> bool:
+        return cls._connected
+
+    @classmethod
+    def _get_db(cls):
+        return cls._db
+
+    # ---------- UYARILAR ----------
+
+    @classmethod
+    async def add_warn(cls, guild_id: int, user_id: int, moderator_id: int, reason: str) -> int:
+        """Uyarı ekle ve toplam sayıyı döndür."""
+        if not cls._connected:
+            return 0
+        try:
+            doc = {
+                "guild_id": guild_id,
+                "user_id": user_id,
+                "moderator_id": moderator_id,
+                "reason": reason,
+                "timestamp": datetime.utcnow()
+            }
+            await cls._db["warns"].insert_one(doc)
+            count = await cls._db["warns"].count_documents({
+                "guild_id": guild_id,
+                "user_id": user_id
+            })
+            return count
+        except Exception as e:
+            logger.error(f"Uyarı ekleme hatası: {e}")
+            return 0
+
+    @classmethod
+    async def get_warns(cls, guild_id: int, user_id: int) -> List[Dict[str, Any]]:
+        if not cls._connected:
+            return []
+        try:
+            cursor = cls._db["warns"].find({
+                "guild_id": guild_id,
+                "user_id": user_id
+            }).sort("timestamp", -1)
+            return await cursor.to_list(length=50)
+        except Exception as e:
+            logger.error(f"Uyarı okuma hatası: {e}")
+            return []
+
+    @classmethod
+    async def get_warn_count(cls, guild_id: int, user_id: int) -> int:
+        if not cls._connected:
+            return 0
+        try:
+            return await cls._db["warns"].count_documents({
+                "guild_id": guild_id,
+                "user_id": user_id
+            })
+        except Exception as e:
+            logger.error(f"Uyarı sayma hatası: {e}")
+            return 0
+
+    @classmethod
+    async def clear_warns(cls, guild_id: int, user_id: int) -> int:
+        if not cls._connected:
+            return 0
+        try:
+            result = await cls._db["warns"].delete_many({
+                "guild_id": guild_id,
+                "user_id": user_id
+            })
+            return result.deleted_count
+        except Exception as e:
+            logger.error(f"Uyarı temizleme hatası: {e}")
+            return 0
+
+    # ---------- GÜVENLİK KAYITLARI ----------
+
+    @classmethod
+    async def add_log(cls, guild_id: int, event_type: str, details: str, actor_id: int = None) -> bool:
+        if not cls._connected:
+            return False
+        try:
+            doc = {
+                "guild_id": guild_id,
+                "type": event_type,
+                "details": details,
+                "actor_id": actor_id,
+                "timestamp": datetime.utcnow()
+            }
+            await cls._db["security_logs"].insert_one(doc)
+            return True
+        except Exception as e:
+            logger.error(f"Kayıt ekleme hatası: {e}")
+            return False
+
+    @classmethod
+    async def get_recent_logs(cls, guild_id: int, limit: int = 20) -> List[Dict[str, Any]]:
+        if not cls._connected:
+            return []
+        try:
+            cursor = cls._db["security_logs"].find(
+                {"guild_id": guild_id}
+            ).sort("timestamp", -1).limit(limit)
+            return await cursor.to_list(length=limit)
+        except Exception as e:
+            logger.error(f"Kayıt okuma hatası: {e}")
+            return []
+
+    # ---------- YAPILANDIRMA ----------
+
+    @classmethod
+    async def save_guild_config(cls, guild_id: int, config: Dict) -> bool:
+        if not cls._connected:
+            return False
+        try:
+            config["guild_id"] = guild_id
+            config["updated_at"] = datetime.utcnow()
+            await cls._db["guild_configs"].update_one(
+                {"guild_id": guild_id},
+                {"$set": config},
+                upsert=True
+            )
+            return True
+        except Exception as e:
+            logger.error(f"Yapılandırma kaydetme hatası: {e}")
+            return False
+
+    @classmethod
+    async def load_guild_config(cls, guild_id: int) -> Optional[Dict]:
+        if not cls._connected:
+            return None
+        try:
+            doc = await cls._db["guild_configs"].find_one({"guild_id": guild_id})
+            if doc:
+                doc.pop("_id", None)
+                doc.pop("updated_at", None)
+            return doc
+        except Exception as e:
+            logger.error(f"Yapılandırma okuma hatası: {e}")
+            return None
+
+    # ---------- KORUNAN ÖĞELER ----------
+
+    @classmethod
+    async def add_protected_role(cls, guild_id: int, role_id: int) -> bool:
+        if not cls._connected:
+            return False
+        try:
+            await cls._db["protected_roles"].update_one(
+                {"guild_id": guild_id, "role_id": role_id},
+                {"$set": {"guild_id": guild_id, "role_id": role_id}},
+                upsert=True
+            )
+            return True
+        except Exception as e:
+            logger.error(f"Korumalı rol ekleme hatası: {e}")
+            return False
+
+    @classmethod
+    async def remove_protected_role(cls, guild_id: int, role_id: int) -> bool:
+        if not cls._connected:
+            return False
+        try:
+            result = await cls._db["protected_roles"].delete_one(
+                {"guild_id": guild_id, "role_id": role_id}
+            )
+            return result.deleted_count > 0
+        except Exception as e:
+            logger.error(f"Korumalı rol silme hatası: {e}")
+            return False
+
+    @classmethod
+    async def get_protected_roles(cls, guild_id: int) -> List[int]:
+        if not cls._connected:
+            return []
+        try:
+            cursor = cls._db["protected_roles"].find({"guild_id": guild_id})
+            docs = await cursor.to_list(length=100)
+            return [d["role_id"] for d in docs]
+        except Exception as e:
+            logger.error(f"Korumalı rol okuma hatası: {e}")
+            return []
+
+    # ---------- YASAK KELİMELER ----------
+
+    @classmethod
+    async def add_banned_word(cls, guild_id: int, word: str) -> bool:
+        if not cls._connected:
+            return False
+        try:
+            word = word.lower().strip()
+            await cls._db["banned_words"].update_one(
+                {"guild_id": guild_id, "word": word},
+                {"$set": {"guild_id": guild_id, "word": word}},
+                upsert=True
+            )
+            return True
+        except Exception as e:
+            logger.error(f"Yasak kelime ekleme hatası: {e}")
+            return False
+
+    @classmethod
+    async def remove_banned_word(cls, guild_id: int, word: str) -> bool:
+        if not cls._connected:
+            return False
+        try:
+            result = await cls._db["banned_words"].delete_one(
+                {"guild_id": guild_id, "word": word.lower().strip()}
+            )
+            return result.deleted_count > 0
+        except Exception as e:
+            logger.error(f"Yasak kelime silme hatası: {e}")
+            return False
+
+    @classmethod
+    async def get_banned_words(cls, guild_id: int) -> List[str]:
+        if not cls._connected:
+            return []
+        try:
+            cursor = cls._db["banned_words"].find({"guild_id": guild_id})
+            docs = await cursor.to_list(length=500)
+            return [d["word"] for d in docs]
+        except Exception as e:
+            logger.error(f"Yasak kelime okuma hatası: {e}")
+            return []
+
+    # ---------- ANTI-RAID TAKİBİ ----------
+
+    @classmethod
+    async def record_join(cls, guild_id: int, user_id: int) -> int:
+        """Üye girişini kaydet ve son 60 saniyedeki toplam giriş sayısını döndür."""
+        if not cls._connected:
+            return 0
+        try:
+            now = datetime.utcnow()
+            await cls._db["join_events"].insert_one({
+                "guild_id": guild_id,
+                "user_id": user_id,
+                "timestamp": now
+            })
+            from datetime import timedelta
+            threshold = now - timedelta(seconds=60)
+            count = await cls._db["join_events"].count_documents({
+                "guild_id": guild_id,
+                "timestamp": {"$gte": threshold}
+            })
+            return count
+        except Exception as e:
+            logger.error(f"Giriş kaydı hatası: {e}")
+            return 0
+
+    @classmethod
+    async def cleanup_old_joins(cls, guild_id: int) -> None:
+        """60 saniyeden eski giriş kayıtlarını temizle."""
+        if not cls._connected:
+            return
+        try:
+            from datetime import timedelta
+            threshold = datetime.utcnow() - timedelta(seconds=120)
+            await cls._db["join_events"].delete_many({
+                "guild_id": guild_id,
+                "timestamp": {"$lt": threshold}
+            })
+        except Exception as e:
+            logger.error(f"Eski giriş temizleme hatası: {e}")
+
+    @classmethod
+    async def close(cls) -> None:
+        if cls._client:
+            cls._client.close()
+            cls._connected = False
 
 # Modern renk paleti
 COLORS = {
